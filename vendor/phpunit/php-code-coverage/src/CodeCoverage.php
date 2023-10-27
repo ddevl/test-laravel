@@ -14,6 +14,7 @@ use function array_diff_key;
 use function array_flip;
 use function array_keys;
 use function array_merge;
+use function array_merge_recursive;
 use function array_unique;
 use function count;
 use function explode;
@@ -35,6 +36,11 @@ use SebastianBergmann\CodeUnitReverseLookup\Wizard;
 
 /**
  * Provides collection functionality for PHP code coverage information.
+ *
+ * @psalm-type TestType = array{
+ *     size: string,
+ *     status: string,
+ * }
  */
 final class CodeCoverage
 {
@@ -51,7 +57,12 @@ final class CodeCoverage
     private bool $useAnnotationsForIgnoringCode = true;
 
     /**
-     * @psalm-var array<string, array{size: string, status: string}>
+     * @psalm-var array<string,list<int>>
+     */
+    private array $linesToBeIgnored = [];
+
+    /**
+     * @psalm-var array<string, TestType>
      */
     private array $tests = [];
 
@@ -61,6 +72,7 @@ final class CodeCoverage
     private array $parentClassesExcludedFromUnintentionallyCoveredCodeCheck = [];
     private ?FileAnalyser $analyser                                         = null;
     private ?string $cacheDirectory                                         = null;
+    private ?Directory $cachedReport                                        = null;
 
     public function __construct(Driver $driver, Filter $filter)
     {
@@ -75,7 +87,11 @@ final class CodeCoverage
      */
     public function getReport(): Directory
     {
-        return (new Builder($this->analyser()))->build($this);
+        if ($this->cachedReport === null) {
+            $this->cachedReport = (new Builder($this->analyser()))->build($this);
+        }
+
+        return $this->cachedReport;
     }
 
     /**
@@ -83,10 +99,19 @@ final class CodeCoverage
      */
     public function clear(): void
     {
-        $this->currentId   = null;
-        $this->currentSize = null;
-        $this->data        = new ProcessedCodeCoverageData;
-        $this->tests       = [];
+        $this->currentId    = null;
+        $this->currentSize  = null;
+        $this->data         = new ProcessedCodeCoverageData;
+        $this->tests        = [];
+        $this->cachedReport = null;
+    }
+
+    /**
+     * @internal
+     */
+    public function clearCache(): void
+    {
+        $this->cachedReport = null;
     }
 
     /**
@@ -120,7 +145,7 @@ final class CodeCoverage
     }
 
     /**
-     * @psalm-return array<string, array{size: string, status: string}>
+     * @psalm-return array<string, TestType>
      */
     public function getTests(): array
     {
@@ -128,7 +153,7 @@ final class CodeCoverage
     }
 
     /**
-     * @psalm-param array<string, array{size: string, status: string}> $tests
+     * @psalm-param array<string, TestType> $tests
      */
     public function setTests(array $tests): void
     {
@@ -145,26 +170,39 @@ final class CodeCoverage
         $this->currentSize = $size;
 
         $this->driver->start();
+
+        $this->cachedReport = null;
     }
 
-    public function stop(bool $append = true, TestStatus $status = null, array|false $linesToBeCovered = [], array $linesToBeUsed = []): RawCodeCoverageData
+    /**
+     * @psalm-param array<string,list<int>> $linesToBeIgnored
+     */
+    public function stop(bool $append = true, TestStatus $status = null, array|false $linesToBeCovered = [], array $linesToBeUsed = [], array $linesToBeIgnored = []): RawCodeCoverageData
     {
         $data = $this->driver->stop();
 
-        $this->append($data, null, $append, $status, $linesToBeCovered, $linesToBeUsed);
+        $this->linesToBeIgnored = array_merge_recursive(
+            $this->linesToBeIgnored,
+            $linesToBeIgnored
+        );
 
-        $this->currentId   = null;
-        $this->currentSize = null;
+        $this->append($data, null, $append, $status, $linesToBeCovered, $linesToBeUsed, $linesToBeIgnored);
+
+        $this->currentId    = null;
+        $this->currentSize  = null;
+        $this->cachedReport = null;
 
         return $data;
     }
 
     /**
+     * @psalm-param array<string,list<int>> $linesToBeIgnored
+     *
      * @throws ReflectionException
      * @throws TestIdMissingException
      * @throws UnintentionallyCoveredCodeException
      */
-    public function append(RawCodeCoverageData $rawData, string $id = null, bool $append = true, TestStatus $status = null, array|false $linesToBeCovered = [], array $linesToBeUsed = []): void
+    public function append(RawCodeCoverageData $rawData, string $id = null, bool $append = true, TestStatus $status = null, array|false $linesToBeCovered = [], array $linesToBeUsed = [], array $linesToBeIgnored = []): void
     {
         if ($id === null) {
             $id = $this->currentId;
@@ -173,6 +211,8 @@ final class CodeCoverage
         if ($id === null) {
             throw new TestIdMissingException;
         }
+
+        $this->cachedReport = null;
 
         if ($status === null) {
             $status = TestStatus::unknown();
@@ -189,7 +229,7 @@ final class CodeCoverage
         $this->applyExecutableLinesFilter($rawData);
 
         if ($this->useAnnotationsForIgnoringCode) {
-            $this->applyIgnoredLinesFilter($rawData);
+            $this->applyIgnoredLinesFilter($rawData, $linesToBeIgnored);
         }
 
         $this->data->initializeUnseenData($rawData);
@@ -198,25 +238,27 @@ final class CodeCoverage
             return;
         }
 
-        if ($id !== self::UNCOVERED_FILES) {
-            $this->applyCoversAndUsesFilter(
-                $rawData,
-                $linesToBeCovered,
-                $linesToBeUsed,
-                $size
-            );
-
-            if (empty($rawData->lineCoverage())) {
-                return;
-            }
-
-            $this->tests[$id] = [
-                'size'   => $size->asString(),
-                'status' => $status->asString(),
-            ];
-
-            $this->data->markCodeAsExecutedByTestCase($id, $rawData);
+        if ($id === self::UNCOVERED_FILES) {
+            return;
         }
+
+        $this->applyCoversAndUsesFilter(
+            $rawData,
+            $linesToBeCovered,
+            $linesToBeUsed,
+            $size
+        );
+
+        if (empty($rawData->lineCoverage())) {
+            return;
+        }
+
+        $this->tests[$id] = [
+            'size'   => $size->asString(),
+            'status' => $status->asString(),
+        ];
+
+        $this->data->markCodeAsExecutedByTestCase($id, $rawData);
     }
 
     /**
@@ -231,6 +273,8 @@ final class CodeCoverage
         $this->data->merge($that->data);
 
         $this->tests = array_merge($this->tests, $that->getTests());
+
+        $this->cachedReport = null;
     }
 
     public function enableCheckForUnintentionallyCoveredCode(): void
@@ -402,11 +446,21 @@ final class CodeCoverage
         }
     }
 
-    private function applyIgnoredLinesFilter(RawCodeCoverageData $data): void
+    /**
+     * @psalm-param array<string,list<int>> $linesToBeIgnored
+     */
+    private function applyIgnoredLinesFilter(RawCodeCoverageData $data, array $linesToBeIgnored): void
     {
         foreach (array_keys($data->lineCoverage()) as $filename) {
             if (!$this->filter->isFile($filename)) {
                 continue;
+            }
+
+            if (isset($linesToBeIgnored[$filename])) {
+                $data->removeCoverageDataForLines(
+                    $filename,
+                    $linesToBeIgnored[$filename]
+                );
             }
 
             $data->removeCoverageDataForLines(
@@ -433,7 +487,8 @@ final class CodeCoverage
                         $uncoveredFile,
                         $this->analyser()
                     ),
-                    self::UNCOVERED_FILES
+                    self::UNCOVERED_FILES,
+                    linesToBeIgnored: $this->linesToBeIgnored
                 );
             }
         }
@@ -565,7 +620,9 @@ final class CodeCoverage
         if ($this->cachesStaticAnalysis()) {
             $this->analyser = new CachingFileAnalyser(
                 $this->cacheDirectory,
-                $this->analyser
+                $this->analyser,
+                $this->useAnnotationsForIgnoringCode,
+                $this->ignoreDeprecatedCode
             );
         }
 
